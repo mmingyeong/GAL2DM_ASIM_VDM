@@ -16,9 +16,10 @@ New Features:
     - exclude_list_path: text file listing files to skip
     - include_list_path: text file listing files to keep strictly
     - augmentation: flipping, axis permutations (rotate + mirror family)
-    - normalization:
-        Case 1) minmax -> [0,1] scaling
-        Case 2) zscore -> Z-standardization first, next signed_log10(1+abs(.))
+    - normalization (custom mode):
+        * input channel 0 (ngal): unchanged
+        * input channel 1 (vpec): fixed-range scaling [-4000, 4000] → [-1, 1]
+        * target (typically rho): y' = (1/3) * log10(y + eps)
 """
 
 from __future__ import annotations
@@ -159,66 +160,93 @@ def _apply_spatial_transform(
 # ----------------------------
 # Normalization utilities (NumPy)
 # ----------------------------
-def zscore(x: np.ndarray, eps: float = 1e-12):
-    mu = float(np.mean(x))
-    sig = float(np.std(x))
-    sig = sig if sig > eps else eps
-    return (x - mu) / sig, mu, sig
+def _normalize_vpec_to_minus1_1(
+    vpec: np.ndarray,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """
+    vpec 전용 정규화:
+    - 고정 범위 [-4000, 4000]를 [-1, 1]로 스케일링.
+      일반식: -1 + 2 * (x - vmin)/(vmax - vmin)
+      vmin=-4000, vmax=4000 이면 x / 4000 과 동일.
+    """
+    vmin = -4000.0
+    vmax = 4000.0
+
+    # 범위를 벗어난 값은 안전하게 클리핑
+    vpec = np.clip(vpec, vmin, vmax)
+
+    half_range = 0.5 * (vmax - vmin)  # 4000
+    denom = half_range if half_range > eps else eps
+
+    return (vpec / denom).astype(vpec.dtype, copy=False)  # -> [-1, 1]
 
 
-def signed_log10_1p_abs(x: np.ndarray, eps: float = 1e-12):
-    # signed log so negatives are supported (rho가 양수만이어도 안전)
-    return np.sign(x) * np.log10(1.0 + np.abs(x) + eps)
-
-
-def _minmax_01(arr: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    a_min = float(np.min(arr))
-    a_max = float(np.max(arr))
-    denom = a_max - a_min
-    if denom < eps:
-        return np.zeros_like(arr, dtype=arr.dtype)
-    return (arr - a_min) / (denom + eps)
-
-
-def _zscore_then_signedlog10(arr: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    z, _, _ = zscore(arr, eps=eps)
-    return signed_log10_1p_abs(z, eps=eps).astype(arr.dtype, copy=False)
+def _normalize_rho_log10(
+    rho: np.ndarray,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """
+    rho 전용 정규화:
+        y' = (1/3) * log10(y + eps)
+    rho > 0 가정, eps로 0 방지.
+    """
+    return ((1.0 / 3.0) * np.log10(rho + eps)).astype(rho.dtype, copy=False)
 
 
 def _apply_normalization(
     x: np.ndarray,  # (C,D,H,W)
     y: np.ndarray,  # (D,H,W)
-    mode: Literal["none", "minmax", "zscore"] = "none",
+    mode: Literal["none", "custom"] = "none",
     normalize_input: bool = True,
     normalize_target: bool = False,
     eps: float = 1e-12,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Normalization is per-sample by default (no dataset-wide stats).
-    - minmax: [0,1] scaling
-    - zscore: Z-standardization first, next signed_log10(1+abs(.))
+
+    mode:
+        - "none"   : 정규화 안 함
+        - "custom" :
+            * input:
+                - channel 0 (ngal) : 그대로 사용
+                - channel 1 (vpec) : [-4000, 4000] -> [-1, 1] (x / 4000, 클리핑 포함)
+                - channel 2 이상   : 그대로 사용 (필요시 나중에 규칙 추가 가능)
+            * target:
+                - normalize_target=True 일 때만
+                  y' = (1/3) * log10(y + eps)
     """
 
     if mode == "none":
         return x, y
 
-    def norm_fn(a: np.ndarray) -> np.ndarray:
-        if mode == "minmax":
-            return _minmax_01(a, eps=eps)
-        elif mode == "zscore":
-            return _zscore_then_signedlog10(a, eps=eps)
-        else:
-            raise ValueError(f"Unknown normalization mode: {mode}")
+    if mode != "custom":
+        raise ValueError(f"Unknown normalization mode: {mode}")
 
+    # --- 입력 정규화 ---
     if normalize_input:
-        # normalize per-channel (ngal/vpec 분포 섞지 않음)
+        if x.ndim != 4 or x.shape[0] < 2:
+            raise ValueError(
+                f"custom normalization expects x.shape = (C,D,H,W) with C>=2; got {x.shape}"
+            )
+
         x_out = np.empty_like(x)
-        for c in range(x.shape[0]):
-            x_out[c] = norm_fn(x[c])
+
+        # channel 0 : ngal (그대로)
+        x_out[0] = x[0]
+
+        # channel 1 : vpec -> [-1,1]
+        x_out[1] = _normalize_vpec_to_minus1_1(x[1], eps=eps)
+
+        # 나머지 채널이 있으면 그대로 복사
+        if x.shape[0] > 2:
+            x_out[2:] = x[2:]
+
         x = x_out
 
+    # --- 타깃 정규화 ---
     if normalize_target:
-        y = norm_fn(y)
+        y = _normalize_rho_log10(y, eps=eps)
 
     return np.ascontiguousarray(x), np.ascontiguousarray(y)
 
@@ -374,7 +402,15 @@ def get_dataloader(
         augmentation:
             dict like {"enable": True, "flip": True, "mirror": True, "permute_axes": True}
         normalization:
-            dict like {"mode": "minmax" or "zscore", "normalize_input": True, "normalize_target": False, "eps": 1e-12}
+            dict like {
+                "mode": "none" or "custom",
+                "normalize_input": True,
+                "normalize_target": False,
+                "eps": 1e-12,
+            }
+            # mode="custom" 일 때:
+            #   - input: channel 0(ngal) 그대로, channel 1(vpec)은 [-4000,4000] -> [-1,1]
+            #   - target: normalize_target=True 이면 y' = (1/3)*log10(y + eps)
         apply_augmentation_in:
             which split(s) to apply augmentation in (default: ("train",))
     """
@@ -417,7 +453,7 @@ def get_dataloader(
         files = [f for f in files if f not in excludes]
         logger.info(f"🚫 exclude_list applied (removed {before - len(files)}) from {exclude_list_path}")
 
-    # (3) validate HDF5 keys if requested
+    # (3) validate HDF5 keys if requested)
     if validate_keys:
         files = _filter_files_by_keys(files, target_field=target_field, strict=strict)
         if not files:
@@ -425,7 +461,7 @@ def get_dataloader(
 
     # (4) Dataset
     aug_splits = set(apply_augmentation_in or ())
-    is_training = (split in aug_splits)
+    is_training = split in aug_splits
 
     dataset: Dataset = ASIMHDF5Dataset(
         files,

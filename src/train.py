@@ -115,6 +115,21 @@ def train(args):
     logger.info("🚀 Starting VDM training (Variational Diffusion Model) for 3D voxel fields")
     logger.info(f"Args: {vars(args)}")
 
+    # ---- Normalization config (uses custom mode in data_loader) ----
+    # input:
+    #   - channel 0 (ngal): unchanged
+    #   - channel 1 (vpec): [-4000, 4000] → [-1, 1]
+    # target:
+    #   - if target_field == "rho": y' = (1/3) * log10(y + eps)
+    #   - if target_field == "tscphi": no target normalization (only vpec scaled)
+    normalization_cfg = {
+        "mode": "custom",
+        "normalize_input": True,
+        "normalize_target": (args.target_field == "rho"),
+        "eps": 1e-12,
+    }
+    logger.info(f"🧮 Normalization config: {normalization_cfg}")
+
     # ---- Data ----
     train_loader = get_dataloader(
         yaml_path=args.yaml_path,
@@ -132,6 +147,8 @@ def train(args):
         strict=False,
         exclude_list_path=args.exclude_list,
         include_list_path=args.include_list,
+        augmentation=None if not args.use_augmentation else None,  # placeholder if later needed
+        normalization=normalization_cfg,
     )
     val_loader = get_dataloader(
         yaml_path=args.yaml_path,
@@ -149,6 +166,8 @@ def train(args):
         strict=False,
         exclude_list_path=args.exclude_list,
         include_list_path=args.include_list,
+        augmentation=None if not args.use_augmentation else None,
+        normalization=normalization_cfg,
     )
 
     logger.info(f"📊 Train samples (files): {len(train_loader.dataset)}")
@@ -321,14 +340,16 @@ def train(args):
         # ---- Validation ----
         model.eval()
         val_loss = 0.0
-        with torch.no_grad():
-            for x_val, y_val in val_loader:
-                x_val = x_val.to(args.device, non_blocking=True)
-                y_val = y_val.to(args.device, non_blocking=True)
-                x_val_cond = select_inputs(x_val, args.input_case, args.keep_two_channels)
-                with amp_autocast():
-                    loss_val, metrics_val = compute_vdm_loss(model, x_val_cond, y_val, args)
-                val_loss += loss_val.item() * x_val.size(0)
+        for x_val, y_val in val_loader:
+            x_val = x_val.to(args.device, non_blocking=True)
+            y_val = y_val.to(args.device, non_blocking=True)
+            x_val_cond = select_inputs(x_val, args.input_case, args.keep_two_channels)
+            with amp_autocast():
+                # 여기서는 autograd가 필요함 (VDM 내부에서 autograd.grad 사용)
+                loss_val, metrics_val = compute_vdm_loss(model, x_val_cond, y_val, args)
+            # 그래프는 여기서 끊어주고 스칼라만 누적
+            val_loss += loss_val.detach().item() * x_val.size(0)
+
 
         avg_val_loss = val_loss / len(val_loader.dataset)
         current_lr = scheduler.get_last_lr()[0]
@@ -407,6 +428,13 @@ if __name__ == "__main__":
         "--keep_two_channels",
         action="store_true",
         help="If set, keep in_channels=2 and zero-pad the missing channel for single-channel cases.",
+    )
+
+    # 간단한 augmentation on/off 플래그 (현재는 placeholder, augmentation=None 로 전달)
+    parser.add_argument(
+        "--use_augmentation",
+        action="store_true",
+        help="If set, enable spatial augmentations configured in data_loader (placeholder).",
     )
 
     # Validation & file filtering

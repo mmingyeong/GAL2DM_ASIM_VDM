@@ -11,7 +11,7 @@ Predict with Variational Diffusion Model (VDM + CUNet) and save to HDF5.
 
 Author: Mingyeong Yang (mmingyeong@kasi.re.kr)
 Created: 2025-07-30
-Last-Modified: 2025-11-26
+Last-Modified: 2025-12-11
 """
 
 from __future__ import annotations
@@ -78,6 +78,30 @@ def _ensure_input_shape(x: np.ndarray) -> np.ndarray:
     else:
         raise ValueError(f"Unsupported 'input' shape: {a.shape}")
     return a
+
+
+def _normalize_vpec_inplace(x_ncwhd: np.ndarray, eps: float = 1e-12):
+    """
+    Training에서 사용한 custom normalization과 동일하게
+    - channel 0 (ngal): 그대로
+    - channel 1 (vpec): [-4000, 4000] -> [-1, 1]
+    x_ncwhd: (N,C,D,H,W)
+    """
+    if x_ncwhd.ndim != 5:
+        raise ValueError(f"Expected (N,C,D,H,W), got {x_ncwhd.shape}")
+    if x_ncwhd.shape[1] < 2:
+        # vpec 채널이 없으면 아무 것도 안 함
+        return x_ncwhd
+
+    vpec = x_ncwhd[:, 1, ...]  # (N,D,H,W)
+    vmin = -4000.0
+    vmax = 4000.0
+    vpec = np.clip(vpec, vmin, vmax)
+    half_range = 0.5 * (vmax - vmin)  # 4000
+    denom = half_range if half_range > eps else eps
+    vpec_norm = (vpec / denom).astype(x_ncwhd.dtype, copy=False)  # [-1,1]
+    x_ncwhd[:, 1, ...] = vpec_norm
+    return x_ncwhd
 
 
 def _load_checkpoint(model_path: str, device: torch.device):
@@ -225,6 +249,7 @@ def run_prediction(
             raise KeyError(f"No input-like dataset found in first test file: {test_files[0]}")
         x0_np = f0[key0][:]
     x0_np = _ensure_input_shape(x0_np)  # (N,C,D,H,W)
+    _normalize_vpec_inplace(x0_np)     # 🔑 train과 동일한 vpec 정규화
     _, c0, D, H, W = x0_np.shape
     if c0 not in (1, 2):
         raise ValueError(f"First file input channels must be 1 or 2, got {c0}")
@@ -241,10 +266,10 @@ def run_prediction(
     score_shape = (score_in_ch, D, H, W)
 
     # 3) Build VDM + CUNet and load checkpoint
+    # 🔑 train_vdm.py에서 사용한 CUNet 설정과 동일하게 맞춤 (chs 인자 제거)
     score_model = CUNet(
         shape=score_shape,
         out_channels=score_out_ch,
-        chs=[48, 96, 192, 384],
         s_conditioning_channels=s_cond_ch,
         v_conditioning_dims=[],            # no vector conditioning in this setup
         v_conditioning_type="common_zerolinear",
@@ -340,11 +365,12 @@ def run_prediction(
                     skipped_files.append(input_path)
                     continue
 
-            # Normalize to (N,C,D,H,W)
+            # Normalize to (N,C,D,H,W) and apply SAME vpec normalization as training
             try:
                 x_np = _ensure_input_shape(x_np)
+                _normalize_vpec_inplace(x_np)  # 🔑 training과 동일
             except Exception as e:
-                msg = f"Invalid input shape in {input_path}: {e}"
+                msg = f"Invalid input shape or normalization error in {input_path}: {e}"
                 if on_missing_input == "stop":
                     raise
                 logger.warning(f"⚠️ {msg} — SKIP")
@@ -368,6 +394,12 @@ def run_prediction(
                     f"Post-selection conditioning channels {x_cond.size(1)} "
                     f"!= expected s_conditioning_channels {s_cond_ch} in {input_path}"
                 )
+                if on_missing_input == "stop":
+                    raise RuntimeError(msg)
+                logger.warning(f"⚠️ {msg} — SKIP")
+                skipped_files.append(input_path)
+                continue
+
             # Batched conditional sampling with VDM
             preds = []
             for i in range(0, x_cond.shape[0], batch_size):
@@ -383,12 +415,17 @@ def run_prediction(
                     )
                 preds.append(y_batch.float().cpu().numpy())
 
-            y_pred = np.concatenate(preds, axis=0)  # (N,1,D,H,W)
-            y_pred = np.squeeze(y_pred, axis=1)     # (N,D,H,W) or (D,H,W) if N==1
+            y_pred_norm = np.concatenate(preds, axis=0)  # (N,1,D,H,W)
+            y_pred_norm = np.squeeze(y_pred_norm, axis=1)  # (N,D,H,W) or (D,H,W) if N==1
 
-            # Save prediction
+            # 🔎 주의: 현재 y_pred_norm은 "정규화된 rho 공간"
+            #   y' = (1/3) * log10(y + eps)
+            # 나중에 물리 rho로 복원하려면:
+            #   y = 10**(3 * y_pred_norm) - eps
+
+            # Save prediction (normalized space)
             with h5py.File(output_path, "w") as f_out:
-                f_out.create_dataset("prediction", data=y_pred, compression="gzip")
+                f_out.create_dataset("prediction", data=y_pred_norm, compression="gzip")
                 # Meta-info
                 f_out.attrs["source_file"] = input_path
                 f_out.attrs["model_path"] = model_path
@@ -400,6 +437,7 @@ def run_prediction(
                 f_out.attrs["gamma_min"] = float(gamma_min)
                 f_out.attrs["gamma_max"] = float(gamma_max)
                 f_out.attrs["n_sampling_steps"] = int(n_sampling_steps)
+                f_out.attrs["prediction_space"] = "normalized_rho: y' = (1/3)*log10(y + 1e-12)"
                 if w_cfg is not None:
                     f_out.attrs["w_cfg"] = float(w_cfg)
 

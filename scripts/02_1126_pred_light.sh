@@ -4,13 +4,11 @@
 #SBATCH -e /home/mingyeong/GAL2DM_ASIM_VDM/logs/slurm/%x.%j.err
 #SBATCH -p h100
 #SBATCH --gres=gpu:H100:1
-#SBATCH --cpus-per-task=2
-#SBATCH --mem=16G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
 #SBATCH -t 0-03:00:00
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=mmingyeong@kasi.re.kr
-
-#set -euo pipefail
 
 # -------- Environment --------
 module purge
@@ -66,37 +64,53 @@ if not torch.cuda.is_available():
     sys.exit(2)
 PY
 
-# -------- Checkpoint autodetect --------
-# You can export MODEL_PATH or CKPT_DIR before sbatch to override this logic.
-if [ -z "${MODEL_PATH:-}" ]; then
-  # If CKPT_DIR is provided, use it. Otherwise pick the newest run under results/vdm/*
+# -------- Checkpoint 선택 로직 --------
+# 1) MODEL_PATH가 주어지면 그대로 사용
+# 2) 아니면 CKPT_DIR (run 디렉토리)를 쓰고,
+# 3) 그것도 없으면 results/vdm/* 중 가장 최신 디렉토리 사용
+
+if [ -n "${MODEL_PATH:-}" ]; then
+  # MODEL_PATH가 직접 지정된 경우
+  if [ ! -f "${MODEL_PATH}" ]; then
+    echo "[ERROR] MODEL_PATH not found: ${MODEL_PATH}"
+    exit 1
+  fi
+  CKPT_DIR="$(dirname "${MODEL_PATH}")"
+else
+  # MODEL_PATH가 없는 경우: CKPT_DIR 기준으로 선택
   if [ -z "${CKPT_DIR:-}" ]; then
-    CKPT_DIR="$(ls -dt ${PROJECT_ROOT}/results/vdm/* 2>/dev/null | head -n 1 || true)"
+    # results/vdm/* 중 가장 최신 디렉토리 선택 (디렉토리만)
+    CKPT_DIR="$(ls -dt ${PROJECT_ROOT}/results/vdm/*/ 2>/dev/null | head -n 1 || true)"
     if [ -z "${CKPT_DIR}" ]; then
       echo "[ERROR] No checkpoint directory found under ${PROJECT_ROOT}/results/vdm/"
       exit 1
     fi
   fi
+
   if [ ! -d "${CKPT_DIR}" ]; then
-    echo "[ERROR] CKPT_DIR not found: ${CKPT_DIR}"
+    echo "[ERROR] CKPT_DIR not found or not a directory: ${CKPT_DIR}"
     exit 1
   fi
-  # Prefer *best*.pt if present
+
+  # 해당 run 디렉토리 안에서 *best*.pt 우선, 없으면 최신 .pt
   BEST_CKPT="$(ls -t ${CKPT_DIR}/*best*.pt 2>/dev/null | head -n 1 || true)"
   if [ -n "${BEST_CKPT}" ]; then
     MODEL_PATH="${BEST_CKPT}"
   else
     MODEL_PATH="$(ls -t ${CKPT_DIR}/*.pt 2>/dev/null | head -n 1 || true)"
   fi
+
   if [ -z "${MODEL_PATH}" ]; then
     echo "[ERROR] No .pt file found in ${CKPT_DIR}"
     exit 1
   fi
 fi
-echo "[INFO] Using checkpoint: ${MODEL_PATH}"
 
-# Output subdir name mirrors checkpoint run stem
-RUN_STEM="$(basename "$(dirname "${MODEL_PATH}")")"
+echo "[INFO] Using checkpoint: ${MODEL_PATH}"
+echo "[INFO] CKPT_DIR        : ${CKPT_DIR}"
+
+# Output subdir name mirrors checkpoint run stem (ex: 71897)
+RUN_STEM="$(basename "${CKPT_DIR}")"
 PRED_OUT_DIR="${OUT_DIR_BASE}/${RUN_STEM}"
 mkdir -p "${PRED_OUT_DIR}"
 
@@ -105,7 +119,7 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 AMP_FLAG="--amp"
 SAMPLE_FRACTION="${SAMPLE_FRACTION:-1.0}"
 
-# VDM + CUNet3D: 입력은 (ngal, vpec) 2ch 이고, train이랑 동일 설정 사용
+# VDM + CUNet3D: 입력은 (ngal, vpec) 2ch, train과 동일
 EXTRA_INPUT_FLAGS="--input_case both --keep_two_channels"
 
 # Single console log under PROJECT_ROOT/logs/RUN_ID
@@ -114,8 +128,8 @@ CONSOLE_LOG="${LOG_DIR}/${MODEL_NAME}_predict.log"
 touch "${CONSOLE_LOG}"
 
 # -------- Run prediction (VDM version) --------
-# predict_vdm.py 를 src/predict_vdm.py 로 두고 있다면:
-srun --ntasks=1 python -u -m src.predict_vdm \
+# predict 코드가 src/predict.py라면:
+srun --ntasks=1 python -u -m src.predict \
   --yaml_path "${YAML_PATH}" \
   --output_dir "${PRED_OUT_DIR}" \
   --model_path "${MODEL_PATH}" \
